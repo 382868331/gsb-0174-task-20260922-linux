@@ -1,23 +1,44 @@
 """Reusable worst-case response-time analysis for fixed-priority task sets."""
 
 from .core import (
+    CRITICALITY_HI,
+    CRITICALITY_LO,
     DEFAULT_MAX_ITERATIONS,
     MAX_TASKS,
+    MC_BOUND_KNOWN,
+    MC_BOUND_MISS,
+    MC_BOUND_UNKNOWN,
     BlockingInfo,
     CriticalSection,
     IterationRecord,
+    MCTaskReport,
+    MCReport,
+    ModeBound,
     Report,
     Task,
     TaskReport,
     ValidationError,
     analyze,
+    analyze_mc,
 )
-from .simulate import JobRecord, SimResult, simulate
+from .simulate import (
+    MCJobRecord,
+    MCSimResult,
+    JobRecord,
+    SimResult,
+    simulate,
+    simulate_mc,
+)
 
 __all__ = [
     "MAX_TASKS",
     "DEFAULT_MAX_ITERATIONS",
     "ValidationError",
+    "CRITICALITY_LO",
+    "CRITICALITY_HI",
+    "MC_BOUND_KNOWN",
+    "MC_BOUND_MISS",
+    "MC_BOUND_UNKNOWN",
     "CriticalSection",
     "Task",
     "BlockingInfo",
@@ -25,7 +46,14 @@ __all__ = [
     "TaskReport",
     "Report",
     "analyze",
+    "ModeBound",
+    "MCTaskReport",
+    "MCReport",
+    "analyze_mc",
     "JobRecord",
     "SimResult",
     "simulate",
+    "MCJobRecord",
+    "MCSimResult",
+    "simulate_mc",
 ]

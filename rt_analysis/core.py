@@ -20,6 +20,12 @@ Model (explicitly conservative, see README):
 
 All arithmetic is exact integer / rational arithmetic; no floating point is
 used anywhere in the analysis.
+
+Mixed-criticality extension (:func:`analyze_mc`): two execution modes LO and
+HI with two WCET budgets per HI task, no shared resources.  Three bounds are
+solved per task: the plain LO-mode bound, the steady HI-mode bound, and the
+AMC-rtb transition bound (LO interference at LO budget, HI interference at
+HI budget, own execution at HI budget).  See README for the scoped subset.
 """
 
 from __future__ import annotations
@@ -33,6 +39,9 @@ __all__ = [
     "MAX_TASKS",
     "DEFAULT_MAX_ITERATIONS",
     "ValidationError",
+    "CRITICALITY_LO",
+    "CRITICALITY_HI",
+    "CRITICALITY_LEVELS",
     "CriticalSection",
     "Task",
     "BlockingInfo",
@@ -40,6 +49,10 @@ __all__ = [
     "TaskReport",
     "Report",
     "analyze",
+    "ModeBound",
+    "MCTaskReport",
+    "MCReport",
+    "analyze_mc",
 ]
 
 #: Maximum number of tasks accepted by :func:`analyze` (interface bound).
@@ -54,6 +67,16 @@ DEFAULT_MAX_ITERATIONS = 1000
 STATUS_SCHEDULABLE = "schedulable"
 STATUS_DEADLINE_MISS = "deadline_miss"
 STATUS_BUDGET_EXHAUSTED = "iteration_budget_exhausted"
+
+#: Mixed-criticality execution modes / per-task criticality labels.
+CRITICALITY_LO = "LO"
+CRITICALITY_HI = "HI"
+CRITICALITY_LEVELS = (CRITICALITY_LO, CRITICALITY_HI)
+
+#: Per-mode outcomes of one mixed-criticality response-time bound.
+MC_BOUND_KNOWN = "known"
+MC_BOUND_MISS = "deadline_miss"
+MC_BOUND_UNKNOWN = "unknown"
 
 
 class ValidationError(ValueError):
@@ -81,6 +104,13 @@ class Task:
     integers in the model's time unit, with ``1 <= D <= T``, ``C >= 1`` and
     ``J >= 0``.  ``critical_sections`` lists the (flat, non-nested) critical
     sections the task may execute; their lengths must sum to at most ``C``.
+
+    For mixed-criticality analysis (:func:`analyze_mc`) ``criticality`` is
+    :data:`CRITICALITY_LO` or :data:`CRITICALITY_HI`.  A HI task carries a
+    second, high-mode execution budget ``wcet_hi`` (``C_HI >= C``); a LO
+    task must leave ``wcet_hi`` as ``None`` (it has no high budget and is
+    dropped after the switch).  These fields default to a plain LO task, so
+    every existing ``Task(...)`` call stays valid for :func:`analyze`.
     """
 
     name: str
@@ -89,6 +119,8 @@ class Task:
     deadline: int
     jitter: int = 0
     critical_sections: tuple[CriticalSection, ...] = ()
+    criticality: str = CRITICALITY_LO
+    wcet_hi: int | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +185,64 @@ class Report:
     utilization: Fraction
     utilization_ok: bool
     tasks: tuple[TaskReport, ...]
+    guaranteed: bool
+    summary: str
+
+
+@dataclass(frozen=True)
+class ModeBound:
+    """One response-time bound of a task under one mixed-criticality view.
+
+    ``kind`` is ``"LO"`` (plain low mode), ``"HI"`` (steady high mode) or
+    ``"AMC-rtb"`` (the mode-switch transition).  ``status`` is one of
+    :data:`MC_BOUND_KNOWN` (``value`` is the exact integer bound),
+    :data:`MC_BOUND_MISS` (the bound provably exceeds ``D - J``) or
+    :data:`MC_BOUND_UNKNOWN` (the iteration budget ran out before either
+    conclusion).  ``iterations`` records every fixed-point round.
+    """
+
+    kind: str
+    status: str
+    value: int | None
+    limit: int
+    iterations: tuple[IterationRecord, ...]
+    detail: str
+
+
+@dataclass(frozen=True)
+class MCTaskReport:
+    """Per-task mixed-criticality outcome.
+
+    Every task gets a :attr:`lo` bound.  HI-criticality tasks additionally
+    get :attr:`hi` (steady HI mode) and :attr:`amc_rtb` (transition) bounds;
+    both are ``None`` for LO tasks, which stop being scheduled after the
+    switch.  ``guaranteed`` means every bound applicable to the task is
+    known and within ``D - J``.
+    """
+
+    name: str
+    criticality: str
+    lo: ModeBound
+    hi: ModeBound | None
+    amc_rtb: ModeBound | None
+    guaranteed: bool
+
+
+@dataclass(frozen=True)
+class MCReport:
+    """Result of :func:`analyze_mc`.
+
+    ``utilization_lo`` / ``utilization_hi`` are the exact rationals
+    ``sum C(LO)/T`` and ``sum_{HI tasks} C(HI)/T``.  ``guaranteed`` is true
+    only when both utilizations are at most 1 AND every applicable per-task
+    bound is known within its deadline; LO tasks only need the LO bound, HI
+    tasks need all three bounds.
+    """
+
+    utilization_lo: Fraction
+    utilization_hi: Fraction
+    utilization_ok: bool
+    tasks: tuple[MCTaskReport, ...]
     guaranteed: bool
     summary: str
 
@@ -226,6 +316,38 @@ def _validate_task(raw, index: int) -> Task:
     if j < 0:
         raise ValidationError(f"task{where}: field 'jitter' must be >= 0, got {j}")
 
+    criticality = raw.criticality
+    if criticality not in CRITICALITY_LEVELS:
+        raise ValidationError(
+            f"task{where}: field 'criticality' must be one of {CRITICALITY_LEVELS}, "
+            f"got {criticality!r}"
+        )
+    if raw.wcet_hi is None:
+        c_hi = None
+    else:
+        c_hi = _as_int(raw.wcet_hi, field="wcet_hi", index=index, task_name=name)
+        if c_hi < 1:
+            raise ValidationError(
+                f"task{where}: field 'wcet_hi' must be >= 1, got {c_hi}"
+            )
+        if c_hi < c:
+            raise ValidationError(
+                f"task{where}: field 'wcet_hi' ({c_hi}) must be >= 'wcet' ({c}): "
+                f"the high-mode budget cannot be smaller than the low-mode budget"
+            )
+    if criticality == CRITICALITY_HI:
+        if c_hi is None:
+            raise ValidationError(
+                f"task{where}: a HI-criticality task must provide 'wcet_hi' "
+                f"(its high-mode execution budget)"
+            )
+    elif c_hi is not None:
+        raise ValidationError(
+            f"task{where}: a LO-criticality task must not provide 'wcet_hi' "
+            f"(got {c_hi}); LO tasks have no high-mode budget and are dropped "
+            f"after the mode switch"
+        )
+
     if not isinstance(raw.critical_sections, (tuple, list)):
         raise ValidationError(
             f"task{where}: field 'critical_sections' must be a tuple/list of "
@@ -265,6 +387,8 @@ def _validate_task(raw, index: int) -> Task:
         deadline=d,
         jitter=j,
         critical_sections=tuple(sections),
+        criticality=criticality,
+        wcet_hi=c_hi,
     )
 
 
@@ -441,6 +565,233 @@ def analyze(
         )
     return Report(
         utilization=utilization,
+        utilization_ok=utilization_ok,
+        tasks=tuple(reports),
+        guaranteed=guaranteed,
+        summary=summary,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mixed-criticality analysis (LO/HI modes, AMC-rtb transition bound)
+#
+# Scoped subset (see README): single core, fixed priorities, NO shared
+# resources, two modes with two WCET budgets per HI task.  A job of a HI task
+# executing beyond its LO budget triggers the switch; after the switch LO
+# tasks start no new jobs while HI tasks run at their HI budget.
+# ---------------------------------------------------------------------------
+
+
+def _validate_mc_task_set(tasks: Sequence[Task]) -> tuple[Task, ...]:
+    normalized = _validate_task_set(tasks)
+    for i, task in enumerate(normalized):
+        if task.critical_sections:
+            raise ValidationError(
+                f"task (index {i}, name {task.name!r}): analyze_mc() is scoped "
+                f"to task sets without shared resources, but the task declares "
+                f"{len(task.critical_sections)} critical section(s); use analyze() "
+                f"for the resource/PCP model"
+            )
+    if not any(t.criticality == CRITICALITY_HI for t in normalized):
+        raise ValidationError(
+            "analyze_mc() requires at least one HI-criticality task (a task with "
+            "criticality='HI' and wcet_hi); a LO-only set has no mode switch and "
+            "should be analyzed with analyze()"
+        )
+    return normalized
+
+
+def _mc_fixed_point(
+    kind: str,
+    task: Task,
+    own_c: int,
+    contributors: tuple[tuple[str, int, int, int], ...],  # (name, budget C, J, T)
+    max_iterations: int,
+) -> ModeBound:
+    """Solve R = own_c + sum ceil((R + J_h)/T_h) * C_h to a fixed point.
+
+    Returns a :class:`ModeBound` classified as known / deadline_miss /
+    unknown (budget exhausted).  ``contributors`` is already restricted to
+    the higher-priority tasks present in the corresponding mode and carries
+    the per-mode execution budget of each.
+    """
+    limit = task.deadline - task.jitter
+    r = own_c
+    iterations: list[IterationRecord] = []
+    for round_no in range(max_iterations):
+        counts = tuple(
+            (name, -(-((r + jitter)) // period))  # exact ceil, integers only
+            for name, _budget, jitter, period in contributors
+        )
+        nxt = own_c + sum(
+            n * budget
+            for (_name, budget, _j, _t), (_n, n) in zip(contributors, counts)
+        )
+        iterations.append(
+            IterationRecord(round=round_no, value=r, interference=counts, next_value=nxt)
+        )
+        if nxt > limit:
+            return ModeBound(
+                kind=kind,
+                status=MC_BOUND_MISS,
+                value=None,
+                limit=limit,
+                iterations=tuple(iterations),
+                detail=(
+                    f"{kind}: round {round_no}: R={nxt} exceeds D-J={limit} "
+                    f"(deadline miss proven within the model)"
+                ),
+            )
+        if nxt == r:
+            return ModeBound(
+                kind=kind,
+                status=MC_BOUND_KNOWN,
+                value=r,
+                limit=limit,
+                iterations=tuple(iterations),
+                detail=f"{kind}: converged after {round_no + 1} round(s): R={r} <= D-J={limit}",
+            )
+        if nxt < r:  # unreachable: the recurrence is monotone non-decreasing
+            raise AssertionError(
+                f"internal error: non-monotone {kind} iteration for task {task.name!r}"
+            )
+        r = nxt
+    return ModeBound(
+        kind=kind,
+        status=MC_BOUND_UNKNOWN,
+        value=None,
+        limit=limit,
+        iterations=tuple(iterations),
+        detail=(
+            f"{kind}: iteration budget of {max_iterations} round(s) exhausted at "
+            f"R={r} (unknown: neither converged nor proven to miss)"
+        ),
+    )
+
+
+def analyze_mc(
+    tasks: Sequence[Task], *, max_iterations: int = DEFAULT_MAX_ITERATIONS
+) -> MCReport:
+    """Analyze a dual-criticality (LO/HI) fixed-priority task set.
+
+    Returns per-task response-time bounds, or ``unknown`` where the search
+    budget is inconclusive:
+
+    * **LO bound** (every task): all tasks execute at their LO budget —
+      behaviour before any mode switch.
+    * **HI bound** (HI tasks only): steady HI mode; only HI tasks remain,
+      each at its ``wcet_hi`` budget.
+    * **AMC-rtb bound** (HI tasks only): the mode-switch transition.  The
+      analyzed job executes at its HI budget; higher-priority LO tasks
+      interfere at LO budget, higher-priority HI tasks at HI budget.  LO
+      tasks start no new jobs after the switch, so they receive no such
+      bound (they are not scheduled in HI mode).
+
+    Scoped to a single core and task sets without shared resources; such
+    inputs raise :class:`ValidationError`, as do all other contract
+    violations.  The function is pure: a failed call leaves no partial
+    state.  Utilization is reported for both modes; either one above 1 makes
+    the set unguaranteeable but is not a format error.
+    """
+    max_iterations = _as_int(
+        max_iterations, field="max_iterations", index=None, task_name=None
+    )
+    if max_iterations < 1:
+        raise ValidationError(f"'max_iterations' must be >= 1, got {max_iterations}")
+    normalized = _validate_mc_task_set(tasks)
+
+    utilization_lo = sum(
+        (Fraction(t.wcet, t.period) for t in normalized), Fraction(0)
+    )
+    utilization_hi = sum(
+        (
+            Fraction(t.wcet_hi, t.period)
+            for t in normalized
+            if t.criticality == CRITICALITY_HI
+        ),
+        Fraction(0),
+    )
+    utilization_ok = utilization_lo <= 1 and utilization_hi <= 1
+
+    reports: list[MCTaskReport] = []
+    for i, task in enumerate(normalized):
+        hp = normalized[:i]
+
+        # LO mode: every higher-priority task interferes at its LO budget.
+        lo_contrib = tuple((h.name, h.wcet, h.jitter, h.period) for h in hp)
+        lo = _mc_fixed_point(
+            CRITICALITY_LO, task, task.wcet, lo_contrib, max_iterations
+        )
+
+        hi = None
+        amc = None
+        guaranteed = lo.status == MC_BOUND_KNOWN
+        if task.criticality == CRITICALITY_HI:
+            # Steady HI mode: only higher-priority HI tasks, at HI budget.
+            hi_contrib = tuple(
+                (h.name, h.wcet_hi, h.jitter, h.period)
+                for h in hp
+                if h.criticality == CRITICALITY_HI
+            )
+            hi = _mc_fixed_point(
+                CRITICALITY_HI, task, task.wcet_hi, hi_contrib, max_iterations
+            )
+            # AMC-rtb transition: LO interference at LO budget, HI
+            # interference at HI budget; the crossing job at HI budget.
+            amc_contrib = tuple(
+                (
+                    h.name,
+                    h.wcet_hi if h.criticality == CRITICALITY_HI else h.wcet,
+                    h.jitter,
+                    h.period,
+                )
+                for h in hp
+            )
+            amc = _mc_fixed_point(
+                "AMC-rtb", task, task.wcet_hi, amc_contrib, max_iterations
+            )
+            guaranteed = guaranteed and hi.status == MC_BOUND_KNOWN and amc.status == MC_BOUND_KNOWN
+
+        reports.append(
+            MCTaskReport(
+                name=task.name,
+                criticality=task.criticality,
+                lo=lo,
+                hi=hi,
+                amc_rtb=amc,
+                guaranteed=guaranteed,
+            )
+        )
+
+    if not utilization_ok:
+        why = []
+        if utilization_lo > 1:
+            why.append(f"LO utilization {utilization_lo} > 1")
+        if utilization_hi > 1:
+            why.append(f"HI utilization {utilization_hi} > 1")
+        guaranteed = False
+        summary = "; ".join(why) + ": the task set cannot be guaranteed on one CPU"
+    elif all(r.guaranteed for r in reports):
+        guaranteed = True
+        summary = (
+            f"LO utilization {utilization_lo} and HI utilization {utilization_hi} "
+            f"<= 1; all LO/HI/AMC-rtb bounds converged within D-J: guaranteed under "
+            f"the mixed-criticality model"
+        )
+    else:
+        guaranteed = False
+        bad = []
+        for r in reports:
+            for b in (r.lo, r.hi, r.amc_rtb):
+                if b is not None and b.status != MC_BOUND_KNOWN:
+                    bad.append(f"{r.name}[{b.kind}:{b.status}]")
+        summary = (
+            f"LO utilization {utilization_lo}, HI utilization {utilization_hi} <= 1 "
+            f"but not guaranteed: {', '.join(bad)}"
+        )
+    return MCReport(
+        utilization_lo=utilization_lo,
+        utilization_hi=utilization_hi,
         utilization_ok=utilization_ok,
         tasks=tuple(reports),
         guaranteed=guaranteed,
