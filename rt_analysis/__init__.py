@@ -13,6 +13,22 @@ from .core import (
     analyze,
 )
 from .simulate import JobRecord, SimResult, simulate
+from .mixed import (
+    CRITICALITY_HI,
+    CRITICALITY_LO,
+    MCIterationRecord,
+    MCReport,
+    MCTask,
+    MCTaskReport,
+    ModeReport,
+    analyze_mc,
+)
+from .mc_simulate import (
+    OVERRUN_ALL,
+    MCJobRecord,
+    MCSimResult,
+    simulate_mc,
+)
 
 __all__ = [
     "MAX_TASKS",
@@ -28,4 +44,17 @@ __all__ = [
     "JobRecord",
     "SimResult",
     "simulate",
+    # Mixed-criticality iteration (LO/HI modes, two budgets).
+    "CRITICALITY_LO",
+    "CRITICALITY_HI",
+    "MCTask",
+    "MCIterationRecord",
+    "ModeReport",
+    "MCTaskReport",
+    "MCReport",
+    "analyze_mc",
+    "MCJobRecord",
+    "MCSimResult",
+    "OVERRUN_ALL",
+    "simulate_mc",
 ]
