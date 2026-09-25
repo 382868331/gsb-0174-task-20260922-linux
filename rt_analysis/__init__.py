@@ -12,6 +12,12 @@ from .core import (
     ValidationError,
     analyze,
 )
+from .assign import (
+    DEFAULT_NODE_BUDGET,
+    MAX_ASSIGN_TASKS,
+    AssignmentReport,
+    assign_priorities,
+)
 from .simulate import JobRecord, SimResult, simulate
 
 __all__ = [
@@ -28,4 +34,8 @@ __all__ = [
     "JobRecord",
     "SimResult",
     "simulate",
+    "MAX_ASSIGN_TASKS",
+    "DEFAULT_NODE_BUDGET",
+    "AssignmentReport",
+    "assign_priorities",
 ]
