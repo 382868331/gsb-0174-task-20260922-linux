@@ -13,6 +13,16 @@ from .core import (
     analyze,
 )
 from .simulate import JobRecord, SimResult, simulate
+from .edf import (
+    DEFAULT_MAX_CHECKPOINTS,
+    DEFAULT_MAX_HYPERPERIOD,
+    EdfReport,
+    EdfTask,
+    TaskDemand,
+    analyze_edf,
+    demand_bound,
+)
+from .edf_simulate import EdfJobRecord, EdfSimResult, simulate_edf
 
 __all__ = [
     "MAX_TASKS",
@@ -28,4 +38,14 @@ __all__ = [
     "JobRecord",
     "SimResult",
     "simulate",
+    "DEFAULT_MAX_HYPERPERIOD",
+    "DEFAULT_MAX_CHECKPOINTS",
+    "EdfTask",
+    "TaskDemand",
+    "EdfReport",
+    "analyze_edf",
+    "demand_bound",
+    "EdfJobRecord",
+    "EdfSimResult",
+    "simulate_edf",
 ]

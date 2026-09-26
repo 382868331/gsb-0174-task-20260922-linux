@@ -1,4 +1,94 @@
-# rt_analysis — 固定优先级任务的最坏响应时间界
+# rt_analysis — 固定优先级 WCRT 界 + 单处理器 EDF 需求界分析
+
+本库包含两套相互独立、互不影响的单核实时分析：
+
+1. **固定优先级 WCRT 界**（原有接口，完全保留）：`Task`/`analyze`/`simulate`；
+2. **可抢占 EDF 需求界分析**（本轮新增）：`EdfTask`/`analyze_edf`/
+   `simulate_edf`，任务模型为最小到达间隔为 T 的 sporadic 任务，
+   `dbf(t) = sum max(0, floor((t-D)/T)+1) * C`。
+
+## 环境与 venv
+
+- Python **3.14.7**（仅标准库；代码只用到 3.10+ 特性），Linux 原生运行。
+- 无需任何第三方依赖（`requirements.txt` 只有注释）。
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+python -m unittest discover -s tests -v   # 全部测试（固定优先级 + EDF）
+python demo.py                            # 固定优先级演示
+python demo_iteration.py                  # EDF 正常/边界结果演示（< 90 s）
+```
+
+核心、测试、演示全部离线：不需要网络、账号、密钥、数据库、Docker 或外部服务。
+
+## EDF 需求界分析（新增）
+
+### 接口约定
+
+```python
+from fractions import Fraction
+from rt_analysis import EdfTask, analyze_edf, simulate_edf
+
+tasks = [
+    EdfTask("ctrl",  wcet=Fraction(1, 2), period=2,  deadline=2),
+    EdfTask("sense", wcet=2,              period=5,  deadline=5),
+    EdfTask("log",   wcet=Fraction(3, 2), period=10, deadline=8),
+]
+report = analyze_edf(tasks)
+report.status               # "schedulable" | "unschedulable" | "not_proven"
+report.utilization          # Fraction：精确的 sum(C/T)
+report.hyperperiod          # H = lcm(T)；预算超限时可能为 None
+report.checkpoints_checked  # 实际检查的关键点数
+report.checked_up_to        # 实际验证区间 (0, checked_up_to] 的右端
+report.first_violation      # 最早违反点 t（无违反时 None）
+report.violation_demands    # 违反点处各任务的 (name, jobs, demand)
+```
+
+- **任务模型**：单处理器、可抢占 EDF；sporadic 任务最小到达间隔
+  `period`（T，正整数），相对截止期 `deadline`（D，正整数），
+  `1 <= D <= T`；执行量 `wcet`（C）为**非负有理数**（`int`、
+  `Fraction`，或值为整数的 `float`；非整数 `float` 拒绝以保证精确，
+  分数请传 `fractions.Fraction`）。无锁、无自挂起。
+- **判定**：利用率 `U = sum(C/T) > 1` 直接判不可行（返回
+  `status="unschedulable"`，不抛异常）；否则取超周期
+  `H = lcm(T_i)`，检查 `(0, H]` 内所有关键点
+  `t = D_i + k*T_i`（去重、升序），`dbf(t) > t` 即在最早违反点判
+  不可调度，并返回该点各任务需求与检查范围。
+- **显式预算**：`analyze_edf(tasks, *, max_hyperperiod=1_000_000,
+  max_checkpoints=100_000)`。若 H 或关键点总数超出预算，返回
+  `status="not_proven"`（**未证明**）——这是“信息不足”，绝不能当成
+  “不可调度”。
+- **为什么 H 足够（不是随意截断）**：对任意 t，
+  `dbf(t+H) = dbf(t) + H*U`（长度 H 的窗口中每任务恰好多贡献
+  `H/T_i` 个作业）。当 `U <= 1` 时 `dbf(t+H) <= dbf(t) + H`，故
+  `(0, H]` 上 `dbf(t) <= t` 可逐段归纳推出所有 `t + kH` 也满足；
+  违反若存在，必在 `(0, H]` 内首次出现。此外 dbf 是阶梯函数，在相邻
+  关键点之间恒定而供给 t 单调增长，所以只查 `D_i + kT_i` 跳跃点等价
+  于查遍区间内所有实数 t。
+- **EDF 模拟器** `simulate_edf(tasks, horizon)`：独立的事件驱动
+  抢占式 EDF 模拟（同步释放短到达序列，最早绝对截止期优先，
+  Fraction 精确时间），返回每作业释放/截止/完成时间及是否错过，是
+  独立对照工具，不构成保证的一部分。
+
+### 限制
+
+- 仅覆盖无锁、无自挂起、D <= T 的 implicit/任意截止期 sporadic
+  子集；不含开销、抖动、多核或任务依赖。
+- 周期互质性差时 H 可能巨大；此时只给“未证明”，不做近似替代判定。
+
+### EDF 测试
+
+`tests/test_edf.py` 包含：输入校验；可调度集；U>1；**U 恰好为 1**
+（截止期等于周期可调度、短截止期不可调度）；**零执行量任务**；
+**低利用率短截止期失败**（`U=9/10` 但 `dbf(4)=5>4`，并由独立 EDF
+  模拟观测到具体错过）；全部小整数任务集（C∈0..2、T,D∈1..3）上
+  “逐整数 t 直接需求界枚举”与关键点压缩结果一致；可调度集同步
+  EDF 模拟不错过；有理数执行量精确模拟；两类预算耗尽返回未证明。
+
+---
+
+# 固定优先级 WCRT 界（原有功能，接口保留）
 
 单核固定优先级抢占式任务集的最坏响应时间（WCRT）界分析库。纯 Python
 标准库实现，从零编写，不依赖任何第三方同类实现。
@@ -90,7 +180,10 @@ python demo.py                            # 推导链 + 实际触发的拒绝边
 
 ## 文件
 
-- `rt_analysis/core.py` — 数据结构、校验、`analyze`
-- `rt_analysis/simulate.py` — 离散时间轴 PCP 验证模拟器
-- `tests/` — 校验、分析语义、模拟核对三组测试（期望值均手工推导）
-- `demo.py` — 固定输入演示
+- `rt_analysis/core.py` — 固定优先级：数据结构、校验、`analyze`
+- `rt_analysis/simulate.py` — 固定优先级离散时间轴 PCP 验证模拟器
+- `rt_analysis/edf.py` — EDF：校验、dbf、关键点压缩、`analyze_edf`
+- `rt_analysis/edf_simulate.py` — EDF 独立事件驱动抢占模拟器
+- `tests/` — 校验、固定优先级分析/模拟、EDF 需求界/模拟对照测试
+- `demo.py` — 固定输入固定优先级演示
+- `demo_iteration.py` — EDF 正常结果与各边界演示
