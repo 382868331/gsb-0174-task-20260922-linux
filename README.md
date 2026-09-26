@@ -1,7 +1,20 @@
-# rt_analysis — 固定优先级任务的最坏响应时间界
+# rt_analysis — 固定优先级任务的最坏响应时间界（含周期性供给窗口）
 
-单核固定优先级抢占式任务集的最坏响应时间（WCRT）界分析库。纯 Python
-标准库实现，从零编写，不依赖任何第三方同类实现。
+单核固定优先级抢占式任务集的最坏响应时间（WCRT）界分析库，并支持一种
+明确的周期性处理器供给窗口模型（每周期仅最后 Q 个时间单位可用）。纯
+Python 标准库实现，从零编写，不依赖任何第三方同类实现。
+
+## 隔离 venv 准备（Linux 原生，无需联网装包）
+
+```bash
+python3.14 -m venv .venv          # 任何 3.10+ 均可；仅用到标准库
+source .venv/bin/activate
+python --version                 # 开发环境为 3.14.7
+# requirements.txt 为空/仅标准库，不需要 pip install 任何第三方包
+```
+
+不使用 Docker、外部服务、账号或密钥；不激活 venv 时直接用系统
+`python` 也可以运行。
 
 ## 环境
 
@@ -27,7 +40,8 @@ report.guaranteed                # 整体是否可保证
 report.utilization               # Fraction，精确有理数 sum(C/T)
 report.tasks[i].response_time    # R_i（miss/不确定时为 None）
 report.tasks[i].blocking         # BlockingInfo(amount, source_task, source_resource)
-report.tasks[i].iterations       # 每轮 IterationRecord(value, interference, next_value)
+report.tasks[i].iterations       # 每轮 IterationRecord(value, interference,
+                                 #   next_value, demand, supply, stop_reason)
 report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_budget_exhausted"
 ```
 
@@ -39,6 +53,41 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
   优先级天花板协议，作业在 `k*T` 释放，临界区位于执行开头）。用于
   生成具体调度实例并核对观测响应时间不超过分析界；它是验证辅助，
   不构成保证的一部分。
+
+### 周期性供给窗口（本次唯一新增模型）
+
+```python
+from rt_analysis import SupplyWindow, analyze, minimum_supply, supply_time_for, simulate
+
+supply = SupplyWindow(period=5, window=3)  # 每 5 个时间单位只在最后 3 个可用
+report = analyze(tasks, supply=supply)
+minimum_supply(t, supply)      # 任意连续 t 个槽内、最坏相位下保证的供给槽数
+supply_time_for(demand, supply)  # 其精确整数逆函数
+simulate(tasks, horizon, supply=supply, phases=range(supply.period))
+```
+
+- 可用槽为每个周期的最后 Q 个：`[kP + P - Q, (k+1)P)`，其余时间处理器
+  对所有任务（含临界区）不可用；`0 < Q <= P`，`Q = P` 退化回原模型。
+- **最小供给函数（按到达相位最坏化推导，整数槽精确成立）**：令
+  `k = t // P`、`r = t mod P`，则
+  `sbf(t) = k*Q + max(0, r - (P-Q))`。前 `P-Q` 个槽内保证供给为 0；
+  这**不是** `t*Q/P`（后者忽略最坏到达相位，在窗口边界处会高估供给）。
+  `Q = P` 时 `sbf(t) = t`。
+- **逆函数**：`supply_time_for(d)` 是满足 `sbf(t) >= d` 的最小 t：
+  `gap + floor((d-1)/Q)*P + (d mod Q 或 Q)`，其中 `gap = P-Q`。
+- **与高优先级干扰联立**：每轮先算需求
+  `demand(R) = C_i + B_i + sum_h ceil((R+J_h)/T_h) C_h`，再取
+  `R' = supply_time_for(demand(R))`；从 `R = supply_time_for(C+B)` 起
+  迭代到不动点（可保证）、`R > D_i - J_i`（已证明超时）或迭代预算耗尽
+  （不确定）。每个 `IterationRecord` 同时返回本轮的 `demand`（需求）、
+  `supply`（`sbf(R)` 实际保证供给）、`next_value` 与 `stop_reason`（仅
+  最后一轮非空）。**超时与预算耗尽是两种不同状态**。
+- 利用率仍按 `sum C/T` 计算（任务自身需求口径不变）；`U <= 1` 在供给
+  受限时**不是**充分条件——利用率很低也可能因首个窗口开得太晚而超时，
+  这由响应时间迭代判定，测试与 `demo_iteration.py` 均含该例。
+- `simulate(..., supply=sw, phases=...)`：整数小周期下枚举给定到达相位
+  （作业在 `phi + kT` 释放，供给窗口固定），作为实际排程参照；分析界
+  可保证时必须不小于任何相位下观测到的最坏响应。
 
 ## 模型（明示保守）
 
@@ -76,8 +125,13 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 - 模型不含上下文切换开销、缓存效应、多核、任务间任意依赖；仅覆盖
   本题契约的周期/偶发 + 抖动 + 天花板协议子集，不宣称完整行业标准
   （如完整 OSEK/AUTOSAR 语义）兼容。
-- 模拟器采用一种具体实现（临界区位于执行开头、`k*T` 同步释放），
-  用于“不超过界”的实例级核对，不枚举最坏情形。
+- 模拟器采用一种具体实现（临界区位于执行开头、`k*T`/`phi+k*T` 释放），
+  用于“不超过界”的实例级核对；供给模型下可枚举所有整数到达相位，但
+  模拟器本身仍是验证辅助，不构成保证的一部分。
+- 供给窗口是**单一、明确**的周期性模型：所有任务共享同一处理器供给，
+  窗口相对时刻 0 固定，不建模分层/分级供给、任务专属虚处理器、动态
+  电压频率切换、上下文切换开销或服务器预算补充策略；本库**不**实现
+  完整实时操作系统。
 - 上限 20 任务是接口边界；演示与测试使用小规模确定性数据，未做
   上限规模的压力测试。
 
@@ -86,11 +140,17 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 ```bash
 python -m unittest discover -s tests -v   # 必要测试（约 0.01 s）
 python demo.py                            # 推导链 + 实际触发的拒绝边界（约 0.05 s）
+python demo_iteration.py                  # 供给窗口逐轮需求/供给 + 全相位
+                                          # 模拟核对（约 0.1 s，远低于 90 s）
 ```
 
 ## 文件
 
 - `rt_analysis/core.py` — 数据结构、校验、`analyze`
-- `rt_analysis/simulate.py` — 离散时间轴 PCP 验证模拟器
-- `tests/` — 校验、分析语义、模拟核对三组测试（期望值均手工推导）
+- `rt_analysis/simulate.py` — 离散时间轴 PCP 验证模拟器（含供给窗口、
+  到达相位枚举）
+- `tests/` — 校验、分析语义、模拟核对、供给窗口四组测试（期望值均手工
+  推导；供给函数另用独立的全相位穷举核对）
 - `demo.py` — 固定输入演示
+- `demo_iteration.py` — 供给窗口离线演示（Q=P 退化、极短窗口、低利用率
+  仍超时、逐轮需求/供给/停止理由）

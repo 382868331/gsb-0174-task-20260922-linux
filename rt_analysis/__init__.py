@@ -11,6 +11,9 @@ from .core import (
     TaskReport,
     ValidationError,
     analyze,
+    SupplyWindow,
+    minimum_supply,
+    supply_time_for,
 )
 from .simulate import JobRecord, SimResult, simulate
 
@@ -25,6 +28,9 @@ __all__ = [
     "TaskReport",
     "Report",
     "analyze",
+    "SupplyWindow",
+    "minimum_supply",
+    "supply_time_for",
     "JobRecord",
     "SimResult",
     "simulate",
