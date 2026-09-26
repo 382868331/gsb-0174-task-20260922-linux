@@ -7,12 +7,15 @@ from .core import (
     CriticalSection,
     IterationRecord,
     Report,
+    SupplyWindow,
     Task,
     TaskReport,
     ValidationError,
     analyze,
+    supply_bound,
+    supply_inverse,
 )
-from .simulate import JobRecord, SimResult, simulate
+from .simulate import JobRecord, PhaseSweepResult, SimResult, simulate, simulate_phases
 
 __all__ = [
     "MAX_TASKS",
@@ -20,6 +23,9 @@ __all__ = [
     "ValidationError",
     "CriticalSection",
     "Task",
+    "SupplyWindow",
+    "supply_bound",
+    "supply_inverse",
     "BlockingInfo",
     "IterationRecord",
     "TaskReport",
@@ -27,5 +33,7 @@ __all__ = [
     "analyze",
     "JobRecord",
     "SimResult",
+    "PhaseSweepResult",
     "simulate",
+    "simulate_phases",
 ]

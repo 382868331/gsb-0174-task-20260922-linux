@@ -18,6 +18,14 @@ Model (explicitly conservative, see README):
   the task is declared a deadline miss; if the value stabilises the task is
   guaranteed (under the model's assumptions).
 
+* Optionally the processor is only available inside a periodic service
+  window (SupplyWindow): in every period ``P`` only the last ``Q`` time
+  units are executable (``0 < Q <= P``).  The analysis then uses the
+  model's minimum supply function (see :func:`supply_bound`) so the
+  worst-case arrival phase's supply gap is accounted for; the recurrence
+  becomes ``R = supply_inverse(C_i + B_i + sum_h ...)``.  ``Q == P``
+  degenerates exactly to the always-available model.
+
 All arithmetic is exact integer / rational arithmetic; no floating point is
 used anywhere in the analysis.
 """
@@ -35,6 +43,9 @@ __all__ = [
     "ValidationError",
     "CriticalSection",
     "Task",
+    "SupplyWindow",
+    "supply_bound",
+    "supply_inverse",
     "BlockingInfo",
     "IterationRecord",
     "TaskReport",
@@ -92,6 +103,61 @@ class Task:
 
 
 @dataclass(frozen=True)
+class SupplyWindow:
+    """Periodic processor supply: only the last ``Q`` units of every
+    period ``P`` are executable (``0 < Q <= P``).
+
+    Time unit 0 starts a period, so within period ``k`` the processor is
+    available on the closed-open interval ``[k*P + (P-Q), (k+1)*P)`` and
+    unavailable during the first ``P-Q`` units.  ``Q == P`` means the
+    processor is always available and degenerates to the baseline model.
+    """
+
+    period: int
+    budget: int
+
+
+def supply_bound(t: int, supply: SupplyWindow) -> int:
+    """Minimum supply (executable time units) in any interval of length
+    ``t`` for the last-``Q``-of-``P`` window.
+
+    Worst case starts an interval at the end of a window: it then waits
+    ``P-Q`` units (the longest blackout) before supply resumes.  Writing
+    ``u = max(0, t - (P-Q))`` gives
+
+        sbf(t) = (u // P) * Q + min(Q, u mod P).
+
+    This is the exact minimum over arrival phases, not the average rate
+    ``t * Q/P`` (which ignores the blackout and is unsafe).
+    """
+    p = supply.period
+    q = supply.budget
+    gap = p - q
+    if t <= gap:
+        return 0
+    u = t - gap
+    return (u // p) * q + min(q, u % p)
+
+
+def supply_inverse(needed: int, supply: SupplyWindow) -> int:
+    """Smallest interval length ``t`` with ``supply_bound(t) >= needed``.
+
+    For ``needed >= 1``, with ``f = (needed - 1) // Q`` full windows
+    elapsed before the window that supplies the last unit:
+
+        t = (P-Q) + f*P + (needed - f*Q).
+
+    For ``Q == P`` this is exactly ``needed`` (baseline identity).
+    """
+    if needed <= 0:
+        return 0
+    p = supply.period
+    q = supply.budget
+    full = (needed - 1) // q
+    return (p - q) + full * p + (needed - full * q)
+
+
+@dataclass(frozen=True)
 class BlockingInfo:
     """Blocking term B_i and its origin.
 
@@ -111,13 +177,20 @@ class IterationRecord:
     ``value`` is the candidate R used in this round, ``interference`` pairs
     each higher-priority task name with the number of interfering releases
     ``ceil((value + J_h) / T_h)``, and ``next_value`` is the resulting new
-    candidate ``C + B + sum(count * C_h)``.
+    candidate.  ``demand`` is the execution demand ``C + B + sum(count *
+    C_h)``; ``supply`` is the minimum processor supply available inside an
+    interval of length ``value``.  Without a supply window both collapse
+    onto the identity (``demand == next_value``, ``supply == value``);
+    with one, ``next_value = supply_inverse(demand)`` so the worst-case
+    supply gap is priced in.
     """
 
     round: int
     value: int
     interference: tuple[tuple[str, int], ...]
     next_value: int
+    demand: int | None = None
+    supply: int | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +228,7 @@ class Report:
     tasks: tuple[TaskReport, ...]
     guaranteed: bool
     summary: str
+    supply: SupplyWindow | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -323,22 +397,70 @@ def _blocking(index: int, tasks: tuple[Task, ...], ceilings: dict[str, int]) -> 
     return BlockingInfo(amount=best, source_task=source_task, source_resource=source_resource)
 
 
+def _validate_supply(supply) -> SupplyWindow | None:
+    if supply is None:
+        return None
+    if not isinstance(supply, SupplyWindow):
+        raise ValidationError(
+            f"'supply' must be a rt_analysis.SupplyWindow or None, "
+            f"got {type(supply).__name__} {supply!r}"
+        )
+    p = _as_int(supply.period, field="supply.period", index=None, task_name=None)
+    q = _as_int(supply.budget, field="supply.budget", index=None, task_name=None)
+    if p < 1:
+        raise ValidationError(f"'supply.period' must be >= 1, got {p}")
+    if q < 1:
+        raise ValidationError(f"'supply.budget' must be >= 1, got {q}")
+    if q > p:
+        raise ValidationError(
+            f"'supply.budget' ({q}) must be <= 'supply.period' ({p})"
+        )
+    return SupplyWindow(period=p, budget=q)
+
+
 def _response_time(
-    task: Task, hp: tuple[Task, ...], blocking: BlockingInfo, max_iterations: int
+    task: Task,
+    hp: tuple[Task, ...],
+    blocking: BlockingInfo,
+    max_iterations: int,
+    supply: SupplyWindow | None,
 ) -> TaskReport:
     limit = task.deadline - task.jitter  # miss when R exceeds D_i - J_i
-    r = task.wcet + blocking.amount
+    # Map an execution demand (units of work) to the interval length that
+    # guarantees that much supply; identity when no window is given.
+    if supply is None:
+        def to_time(needed: int) -> int:
+            return needed
+
+        def available(t: int) -> int:
+            return t
+    else:
+        def to_time(needed: int) -> int:
+            return supply_inverse(needed, supply)
+
+        def available(t: int) -> int:
+            return supply_bound(t, supply)
+
+    r = to_time(task.wcet + blocking.amount)
     iterations: list[IterationRecord] = []
     for round_no in range(max_iterations):
         counts = tuple(
             (h.name, -(-(r + h.jitter) // h.period))  # exact ceil, integers only
             for h in hp
         )
-        nxt = task.wcet + blocking.amount + sum(
+        demand = task.wcet + blocking.amount + sum(
             n * h.wcet for h, (_, n) in zip(hp, counts)
         )
+        nxt = to_time(demand)
         iterations.append(
-            IterationRecord(round=round_no, value=r, interference=counts, next_value=nxt)
+            IterationRecord(
+                round=round_no,
+                value=r,
+                interference=counts,
+                next_value=nxt,
+                demand=demand,
+                supply=available(r),
+            )
         )
         if nxt > limit:
             return TaskReport(
@@ -348,7 +470,8 @@ def _response_time(
                 response_time=None,
                 status=STATUS_DEADLINE_MISS,
                 detail=(
-                    f"round {round_no}: R={nxt} exceeds D-J={limit} "
+                    f"round {round_no}: R={nxt} (demand {demand}) exceeds "
+                    f"D-J={limit} "
                     f"(deadline miss proven within the model)"
                 ),
             )
@@ -382,7 +505,10 @@ def _response_time(
 
 
 def analyze(
-    tasks: Sequence[Task], *, max_iterations: int = DEFAULT_MAX_ITERATIONS
+    tasks: Sequence[Task],
+    *,
+    supply: SupplyWindow | None = None,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> Report:
     """Compute worst-case response-time bounds for a fixed-priority task set.
 
@@ -395,6 +521,12 @@ def analyze(
     ``max_iterations`` bounds the fixed-point search per task; exhausting it
     yields status ``iteration_budget_exhausted`` (inconclusive), which is
     distinct from a proven ``deadline_miss``.
+
+    ``supply`` optionally restricts the processor to the last ``Q`` units
+    of every period ``P`` (see :class:`SupplyWindow`).  The iteration then
+    maps execution demand through the window's minimum supply function, so
+    the worst-case arrival phase's blackout is charged to every task;
+    ``Q == P`` reproduces the always-available analysis exactly.
     """
     max_iterations = _as_int(
         max_iterations, field="max_iterations", index=None, task_name=None
@@ -403,6 +535,7 @@ def analyze(
         raise ValidationError(
             f"'max_iterations' must be >= 1, got {max_iterations}"
         )
+    window = _validate_supply(supply)
     normalized = _validate_task_set(tasks)
     ceilings = _resource_ceilings(normalized)
 
@@ -415,7 +548,7 @@ def analyze(
     for i, task in enumerate(normalized):
         blocking = _blocking(i, normalized, ceilings)
         reports.append(
-            _response_time(task, normalized[:i], blocking, max_iterations)
+            _response_time(task, normalized[:i], blocking, max_iterations, window)
         )
 
     if not utilization_ok:
@@ -445,4 +578,5 @@ def analyze(
         tasks=tuple(reports),
         guaranteed=guaranteed,
         summary=summary,
+        supply=window,
     )

@@ -1,4 +1,4 @@
-# rt_analysis — 固定优先级任务的最坏响应时间界
+# rt_analysis — 固定优先级任务的最坏响应时间界（含周期性供给窗口）
 
 单核固定优先级抢占式任务集的最坏响应时间（WCRT）界分析库。纯 Python
 标准库实现，从零编写，不依赖任何第三方同类实现。
@@ -8,6 +8,15 @@
 - Python 3.14.7（仅标准库；实际只用到 3.10+ 的特性）
 - Linux 原生运行，安装 Python 后无需安装任何其他依赖
 - 核心、测试、演示全部离线：不需要网络、账号、密钥、数据库或 Docker
+
+## 准备（隔离 venv）
+
+```bash
+python3 -m venv .venv          # 隔离环境；不安装任何第三方包
+source .venv/bin/activate      # 或直接使用 .venv/bin/python
+```
+
+requirements.txt 为空（仅注释），无需 pip install。
 
 ## 接口
 
@@ -32,13 +41,56 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 ```
 
 - **任务顺序即优先级**：`tasks[0]` 优先级最高。最多 **20** 个任务。
-- `analyze(tasks, *, max_iterations=1000)`：`max_iterations` 是每任务
-  不动点迭代的搜索预算。预算耗尽得到 `iteration_budget_exhausted`
-  （不确定），与已证明的 `deadline_miss` 严格区分。
+- `analyze(tasks, *, supply=None, max_iterations=1000)`：`max_iterations`
+  是每任务不动点迭代的搜索预算。预算耗尽得到
+  `iteration_budget_exhausted`（不确定），与已证明的 `deadline_miss`
+  严格区分。
 - `simulate(tasks, horizon)`：离散时间轴验证模拟器（固定优先级抢占 +
   优先级天花板协议，作业在 `k*T` 释放，临界区位于执行开头）。用于
   生成具体调度实例并核对观测响应时间不超过分析界；它是验证辅助，
   不构成保证的一部分。
+
+## 周期性供给窗口（新增）
+
+处理器只在每个周期 `P` 的最后 `Q` 个时间单位可执行（`0 < Q <= P`），
+其余时间不可用：
+
+```python
+from rt_analysis import SupplyWindow, analyze, simulate, simulate_phases
+from rt_analysis import supply_bound, supply_inverse
+
+window = SupplyWindow(period=4, budget=2)   # 每 4 拍只有最后 2 拍可执行
+report = analyze(tasks, supply=window)      # 响应时间界计入最坏到达相位的空档
+report.tasks[i].iterations[j]               # IterationRecord 增加 demand / supply 字段
+sim    = simulate(tasks, horizon, supply=window, phase=0)
+sweep  = simulate_phases(tasks, horizon, supply=window)  # 枚举全部到达相位
+sweep.worst_response()                      # 各任务跨相位最大观测响应时间
+```
+
+模型与推导：
+
+- 窗口在第 `k` 个周期的 `[k*P + (P-Q), (k+1)*P)` 内供处理器。最坏到达
+  相位下区间先经历最长 `P-Q` 的空档，故**最小供给函数**为
+  `sbf(t) = (u // P) * Q + min(Q, u mod P)`，其中 `u = max(0, t-(P-Q))`。
+  这是对相位取最小值的精确供给下界，**不是**平均速率 `t*Q/P`；因此
+  分析不把执行时间简单除以 `Q/P`（那会忽略空档，偏于不安全）。
+- 需求侧与基线相同：`demand(t) = C_i + B_i + ceil((t+J_h)/T_h)*C_h` 求和。
+  迭代把需求经供给反函数映射回时间：`R' = supply_inverse(demand(R))`，
+  `supply_inverse(x)` 是满足 `sbf(t) >= x` 的最小 `t`（闭式解）。每轮
+  `IterationRecord` 记录 `value`（时间候选）、`demand`（执行需求）、
+  `supply`（该区间保证供给）与 `next_value`；停止理由照旧区分
+  `deadline_miss`（候选超过 `D_i - J_i`）与
+  `iteration_budget_exhausted`（预算耗尽、不确定）。
+- `Q == P` 时 `sbf(t) = t`、`supply_inverse(x) = x`，逐位退化回
+  基线模型（测试逐轮比对两种调用结果一致）。
+- `simulate(..., supply=window, phase=s)` 在窗口空档拍不调度；
+  `simulate_phases` 枚举 `lcm(P, T_1..T_n)` 个相位（小整数周期下可行），
+  作为实际排程参照核对分析界，包含 `Q=P` 退化、极短窗口与利用率低
+  仍超时的用例（见 `tests/test_supply.py`）。
+
+适用范围：只实现这一种供给模型（周期性最后-Q窗口），不实现完整实时
+操作系统；阻塞项 `B_i` 沿用基线天花板协议上界，在窗口模型下仍为保守
+充分条件。
 
 ## 模型（明示保守）
 
@@ -86,11 +138,13 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 ```bash
 python -m unittest discover -s tests -v   # 必要测试（约 0.01 s）
 python demo.py                            # 推导链 + 实际触发的拒绝边界（约 0.05 s）
+python demo_iteration.py                  # 供给窗口：逐轮需求/供给/停止理由 + 相位枚举（约 0.05 s）
 ```
 
 ## 文件
 
-- `rt_analysis/core.py` — 数据结构、校验、`analyze`
-- `rt_analysis/simulate.py` — 离散时间轴 PCP 验证模拟器
-- `tests/` — 校验、分析语义、模拟核对三组测试（期望值均手工推导）
+- `rt_analysis/core.py` — 数据结构、校验、`analyze`、供给窗口最小供给函数
+- `rt_analysis/simulate.py` — 离散时间轴 PCP 验证模拟器（含窗口与相位枚举）
+- `tests/` — 校验、分析语义、模拟核对、供给窗口四组测试（期望值均手工推导）
 - `demo.py` — 固定输入演示
+- `demo_iteration.py` — 供给窗口固定输入演示
