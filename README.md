@@ -94,3 +94,67 @@ python demo.py                            # 推导链 + 实际触发的拒绝边
 - `rt_analysis/simulate.py` — 离散时间轴 PCP 验证模拟器
 - `tests/` — 校验、分析语义、模拟核对三组测试（期望值均手工推导）
 - `demo.py` — 固定输入演示
+
+
+---
+
+# EDF 需求界分析（本轮新增）
+
+单核可抢占 EDF 的可调度性判定。任务为 sporadic 模型：最小到达间隔
+T（正整数）、相对截止期 D（正整数，D <= T）、执行量 C（非负有理数，
+接受 int / Fraction / 有限 float）。无锁、无自挂起。
+
+## 接口
+
+    from rt_analysis import EdfTask, analyze_edf, dbf, key_points, simulate_edf
+
+    tasks = [EdfTask("fast", 2, 4, 2), EdfTask("slow", 2, 6, 3)]
+    report = analyze_edf(tasks)        # -> EdfReport
+    report.status                      # "schedulable" | "unschedulable" | "unproven"
+    report.utilization                 # Fraction，精确 sum(C/T)
+    report.hyperperiod                 # H = lcm(T)，预算内才给出
+    report.checkpoints                 # 实际检查的 D + k*T 关键点
+    report.checked_until               # 已验证区间 (0, H]
+    report.violation                   # 最早违反点 Violation(time, demand, per_task)
+
+- 判定条件：dbf(t) = sum(max(0, floor((t-D)/T)+1) * C)，dbf(t) <= t
+  对所有 t > 0 成立且 U <= 1 时可调度。
+- 为什么 H 足够而不是随意截断：dbf 只在 D_i + k*T_i 处跃升，两点之间
+  不变而 t 持续增长，所以违反只会先出现在关键点；又 H 是每个 T_i 的
+  倍数，故 dbf(t+H) = dbf(t) + U*H，当 U <= 1 且 (0, H] 内无违反时，
+  任意 t' = t + m*H 满足 dbf(t') <= t + m*U*H <= t'。因此 (0, H] 是
+  证明完备的有限界。
+- U > 1 直接 unschedulable（过载，不做关键点检查）。
+- 预算：analyze_edf(tasks, *, max_hyperperiod=1_000_000,
+  max_checkpoints=100_000)。H 或关键点数超预算时返回 unproven
+  （未证明），与已证明的 unschedulable 严格区分。
+- simulate_edf(tasks, horizon, *, arrivals=None)：独立离散时间 EDF
+  模拟器（抢占、按绝对截止期选作业，arrivals 可给满足最小到达间隔的
+  显式释放序列，缺省 k*T），仅作对照验证，不构成证明的一部分；模拟器
+  要求整数执行量。
+
+## 误差口径与限制（EDF 部分）
+
+- 全部判定用精确整数 / Fraction 运算，无浮点误差；U == 1 按精确相等
+  判为可调度。
+- 模型不含上下文切换开销、多核、锁与自挂起；C 为非负有理数，但模拟器
+  只接受整数 C。
+- 最多 20 个任务（沿用接口边界）；非法输入抛
+  rt_analysis.ValidationError（可定位到任务与字段），analyze_edf 为
+  纯函数。
+
+## 命令
+
+    python -m venv .venv && . .venv/bin/activate   # 准备 venv（可选，无第三方依赖）
+    python -m unittest discover -s tests -v        # 全部测试（约 0.02 s）
+    python demo.py                                 # 固定优先级演示（约 0.05 s）
+    python demo_iteration.py                       # EDF 演示：正常+边界+对照（约 0.06 s）
+
+## 文件（新增）
+
+- rt_analysis/edf.py — EdfTask、dbf、key_points、analyze_edf
+- rt_analysis/simulate.py — 追加 simulate_edf（独立 EDF 模拟器）
+- tests/test_edf.py — 手工推导值、低利用率短截止期失败、U==1、零执行量、
+  预算 unproven、暴力逐点核对关键点压缩、枚举短到达序列的模拟对照
+- demo_iteration.py — EDF 演示入口
+

@@ -12,7 +12,16 @@ from .core import (
     ValidationError,
     analyze,
 )
-from .simulate import JobRecord, SimResult, simulate
+from .edf import (
+    EdfReport,
+    EdfTask,
+    TaskDemand,
+    Violation,
+    analyze_edf,
+    dbf,
+    key_points,
+)
+from .simulate import EdfJobRecord, EdfSimResult, JobRecord, SimResult, simulate, simulate_edf
 
 __all__ = [
     "MAX_TASKS",
@@ -28,4 +37,14 @@ __all__ = [
     "JobRecord",
     "SimResult",
     "simulate",
+    "EdfTask",
+    "TaskDemand",
+    "Violation",
+    "EdfReport",
+    "analyze_edf",
+    "dbf",
+    "key_points",
+    "EdfJobRecord",
+    "EdfSimResult",
+    "simulate_edf",
 ]
