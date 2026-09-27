@@ -28,6 +28,7 @@ report.utilization               # Fraction，精确有理数 sum(C/T)
 report.tasks[i].response_time    # R_i（miss/不确定时为 None）
 report.tasks[i].blocking         # BlockingInfo(amount, source_task, source_resource)
 report.tasks[i].iterations       # 每轮 IterationRecord(value, interference, next_value)
+report.context_switch_cost       # ContextSwitchCost(first_entry, preemption, resumption)
 report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_budget_exhausted"
 ```
 
@@ -35,6 +36,9 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 - `analyze(tasks, *, max_iterations=1000)`：`max_iterations` 是每任务
   不动点迭代的搜索预算。预算耗尽得到 `iteration_budget_exhausted`
   （不确定），与已证明的 `deadline_miss` 严格区分。
+- `analyze(..., context_switch_cost=ContextSwitchCost(first_entry=0,
+  preemption=0, resumption=0))`：以整数时间单位给出 CPU 上的调度代价。非负整数 `1`
+  是三类代价都取 1 的简写；默认全为 0，并逐字段退回原分析。
 - `simulate(tasks, horizon)`：离散时间轴验证模拟器（固定优先级抢占 +
   优先级天花板协议，作业在 `k*T` 释放，临界区位于执行开头）。用于
   生成具体调度实例并核对观测响应时间不超过分析界；它是验证辅助，
@@ -48,9 +52,16 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
   优先级任务；临界区**禁止嵌套**（数据结构本身不表达嵌套）。
 - 阻塞项 `B_i` = 低优先级任务中、天花板不低于 `i` 优先级的资源上的
   最大单个临界区；输出阻塞来源（任务与资源）。
-- 迭代 `R = C_i + B_i + sum_h ceil((R + J_h) / T_h) * C_h`，从
-  `R = C_i + B_i` 开始；候选值超过 `D_i - J_i` 判 miss，值稳定判可
-  保证。相对名义请求时间的延迟界为 `R_i + J_i`。
+- 上下文切换代价采用明确、保守的逐作业记账：被分析任务自身首次进入
+  收 `F_i`；每个落入响应窗口的高优先级作业收其执行 `C_h`、自身首次
+  进入 `F_h`，以及让被分析任务离开/回到 CPU 的一次 `P_i + Q_i`。
+- 迭代
+  `R = C_i + B_i + F_i + sum_h ceil((R + J_h) / T_h)
+  * (C_h + F_h + P_i + Q_i)`，
+  从 `R = C_i + B_i + F_i` 开始。开销位于递归内部：它可能让候选窗口
+  变长、下一轮出现更多高优先级作业，而不是在旧结果后只加常数。候选值
+  超过 `D_i - J_i` 判 miss，值稳定判可保证。相对名义请求时间的延迟界
+  为 `R_i + J_i`。
 - 利用率 `U = sum(C/T)`：`U > 1` 返回 `guaranteed=False`（**不是**
   格式错误）；`U <= 1` 只是必要条件，**不**被当作充分保证。
 
@@ -73,9 +84,11 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 
 - 分析是**保守充分**条件而非精确充要条件：可保证的结论可靠，判 miss
   的结论在该保守模型内成立，但不排除存在更精细分析可通过的实例。
-- 模型不含上下文切换开销、缓存效应、多核、任务间任意依赖；仅覆盖
-  本题契约的周期/偶发 + 抖动 + 天花板协议子集，不宣称完整行业标准
-  （如完整 OSEK/AUTOSAR 语义）兼容。
+- 上下文切换模型只覆盖首次进入、抢占和恢复三种显式 CPU 代价；不含
+  缓存效应、多核、任务间任意依赖。仅覆盖本题契约的周期/偶发 + 抖动 +
+  天花板协议子集，不宣称完整行业标准（如完整 OSEK/AUTOSAR 语义）兼容。
+- 当前验证模拟器仍构造零切换代价的具体调度；因此它可作为非零分析界
+  下的保守实例核对，但不模拟这些切换代价。
 - 模拟器采用一种具体实现（临界区位于执行开头、`k*T` 同步释放），
   用于“不超过界”的实例级核对，不枚举最坏情形。
 - 上限 20 任务是接口边界；演示与测试使用小规模确定性数据，未做

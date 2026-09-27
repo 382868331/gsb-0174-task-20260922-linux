@@ -11,7 +11,13 @@ not raised as a format error).
 
 from fractions import Fraction
 
-from rt_analysis import CriticalSection, Task, ValidationError, analyze
+from rt_analysis import (
+    ContextSwitchCost,
+    CriticalSection,
+    Task,
+    ValidationError,
+    analyze,
+)
 
 
 def demo_task_set():
@@ -44,7 +50,7 @@ def print_chain(report):
                 f"{name}: ceil(({it.value}+J)/T)={n}" for name, n in it.interference
             ) or "no higher-priority tasks"
             print(f"  round {it.round}: R={it.value} -> [{interference}] "
-                  f"-> R'={it.next_value}")
+                  f"-> overhead={it.switch_overhead} -> R'={it.next_value}")
         print(f"  => {task.status}: {task.detail}")
     print(f"\nverdict: guaranteed={report.guaranteed}")
     print(f"summary: {report.summary}")
@@ -52,7 +58,8 @@ def print_chain(report):
 
 def main():
     print("=== Part 1: normal analysis with full derivation chain ===")
-    report = analyze(demo_task_set())
+    overhead = ContextSwitchCost(first_entry=1, preemption=1, resumption=1)
+    report = analyze(demo_task_set(), context_switch_cost=overhead)
     print_chain(report)
 
     print("\n=== Part 2a: invalid input is rejected with a locatable error ===")

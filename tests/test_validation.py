@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from rt_analysis import CriticalSection, Task, ValidationError, analyze
+from rt_analysis import CriticalSection, SwitchOverhead, Task, ValidationError, analyze
 
 
 def base_task(**overrides):
@@ -107,6 +107,13 @@ class TestStructuralValidation(unittest.TestCase):
             analyze([base_task()], max_iterations=0)
         with self.assertRaises(ValidationError):
             analyze([base_task()], max_iterations=True)
+
+    def test_finite_integral_float_overhead_accepted(self):
+        report = analyze(
+            [base_task()],
+            switch_overhead=SwitchOverhead(first_entry=0.0),
+        )
+        self.assertTrue(report.guaranteed)
 
 
 class TestCriticalSectionValidation(unittest.TestCase):

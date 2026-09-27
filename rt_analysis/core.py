@@ -12,11 +12,18 @@ Model (explicitly conservative, see README):
 * The blocking term ``B_i`` is the largest single critical section among
   lower-priority tasks on a resource whose ceiling is at least the priority
   of task ``i`` (i.e. a critical section that can actually block ``i``).
-* The response-time bound is the least fixed point of
-  ``R = C_i + B_i + sum_{h in hp(i)} ceil((R + J_h) / T_h) * C_h``
-  starting from ``R = C_i + B_i``.  If a candidate exceeds ``D_i - J_i``
-  the task is declared a deadline miss; if the value stabilises the task is
-  guaranteed (under the model's assumptions).
+* Optional, explicit scheduling overhead charges one first-entry cost for
+  the analyzed job.  Each interfering job also charges its own
+  first-entry cost plus one preemption and one resumption of the analyzed
+  job.  The response-time bound is the least fixed point of
+  ``R = C_i + B_i + F_i + sum_h ceil((R + J_h) / T_h)
+  * (C_h + F_h + P_i + Q_i)``,
+  where ``F`` is first-entry cost, ``P`` is preemption cost and ``Q`` is
+  resumption cost.  The initial candidate is ``C_i + B_i + F_i``; overhead
+  is inside the recurrence, so it can increase the number of interfering
+  jobs in later rounds.  If a candidate exceeds ``D_i - J_i`` the task is
+  declared a deadline miss; if the value stabilises the task is guaranteed
+  (under the model's assumptions).
 
 All arithmetic is exact integer / rational arithmetic; no floating point is
 used anywhere in the analysis.
@@ -34,6 +41,8 @@ __all__ = [
     "DEFAULT_MAX_ITERATIONS",
     "ValidationError",
     "CriticalSection",
+    "SwitchOverhead",
+    "ContextSwitchCost",
     "Task",
     "BlockingInfo",
     "IterationRecord",
@@ -74,6 +83,24 @@ class CriticalSection:
 
 
 @dataclass(frozen=True)
+class SwitchOverhead:
+    """Integer CPU-time costs charged for scheduling events.
+
+    ``first_entry`` is charged before a job executes for the first time.
+    ``preemption`` is charged when an analyzed job is switched out because a
+    higher-priority job is ready.  ``resumption`` is charged before the
+    analyzed job runs again after that preemption.
+    """
+
+    first_entry: int = 0
+    preemption: int = 0
+    resumption: int = 0
+
+
+ContextSwitchCost = SwitchOverhead
+
+
+@dataclass(frozen=True)
 class Task:
     """A sporadic/periodic fixed-priority task.
 
@@ -111,13 +138,14 @@ class IterationRecord:
     ``value`` is the candidate R used in this round, ``interference`` pairs
     each higher-priority task name with the number of interfering releases
     ``ceil((value + J_h) / T_h)``, and ``next_value`` is the resulting new
-    candidate ``C + B + sum(count * C_h)``.
+    candidate, including the scheduling overhead included in that round.
     """
 
     round: int
     value: int
     interference: tuple[tuple[str, int], ...]
     next_value: int
+    switch_overhead: int = 0
 
 
 @dataclass(frozen=True)
@@ -136,6 +164,7 @@ class TaskReport:
     response_time: int | None
     status: str
     detail: str
+    switch_overhead: SwitchOverhead = SwitchOverhead()
 
 
 @dataclass(frozen=True)
@@ -155,6 +184,12 @@ class Report:
     tasks: tuple[TaskReport, ...]
     guaranteed: bool
     summary: str
+    switch_overhead: SwitchOverhead = SwitchOverhead()
+
+    @property
+    def context_switch_cost(self) -> SwitchOverhead:
+        """Alias for :attr:`switch_overhead`."""
+        return self.switch_overhead
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +324,43 @@ def _validate_task_set(tasks: Sequence[Task]) -> tuple[Task, ...]:
     return normalized
 
 
+def _validate_switch_overhead(switch_overhead: SwitchOverhead | int) -> SwitchOverhead:
+    if isinstance(switch_overhead, bool):
+        raise ValidationError(
+            "'switch_overhead' must be a SwitchOverhead or non-negative integer, "
+            f"got bool {switch_overhead!r}"
+        )
+    if isinstance(switch_overhead, int):
+        cost = switch_overhead
+        if cost < 0:
+            raise ValidationError(f"'switch_overhead' must be >= 0, got {cost}")
+        return SwitchOverhead(
+            first_entry=cost,
+            preemption=cost,
+            resumption=cost,
+        )
+    if not isinstance(switch_overhead, SwitchOverhead):
+        raise ValidationError(
+            "'switch_overhead' must be a SwitchOverhead or non-negative integer, "
+            f"got {type(switch_overhead).__name__} {switch_overhead!r}"
+        )
+    values = {
+        "first_entry": switch_overhead.first_entry,
+        "preemption": switch_overhead.preemption,
+        "resumption": switch_overhead.resumption,
+    }
+    normalized = {}
+    for field, value in values.items():
+        normalized[field] = _as_int(
+            value, field=f"switch_overhead.{field}", index=None, task_name=None
+        )
+        if normalized[field] < 0:
+            raise ValidationError(
+                f"'switch_overhead.{field}' must be >= 0, got {normalized[field]}"
+            )
+    return SwitchOverhead(**normalized)
+
+
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
@@ -324,21 +396,40 @@ def _blocking(index: int, tasks: tuple[Task, ...], ceilings: dict[str, int]) -> 
 
 
 def _response_time(
-    task: Task, hp: tuple[Task, ...], blocking: BlockingInfo, max_iterations: int
+    task: Task,
+    hp: tuple[Task, ...],
+    blocking: BlockingInfo,
+    max_iterations: int,
+    switch_overhead: SwitchOverhead,
 ) -> TaskReport:
     limit = task.deadline - task.jitter  # miss when R exceeds D_i - J_i
-    r = task.wcet + blocking.amount
+    r = task.wcet + blocking.amount + switch_overhead.first_entry
     iterations: list[IterationRecord] = []
     for round_no in range(max_iterations):
         counts = tuple(
             (h.name, -(-(r + h.jitter) // h.period))  # exact ceil, integers only
             for h in hp
         )
-        nxt = task.wcet + blocking.amount + sum(
-            n * h.wcet for h, (_, n) in zip(hp, counts)
+        interference_work = sum(n * h.wcet for h, (_, n) in zip(hp, counts))
+        interference_count = sum(n for _, n in counts)
+        overhead_work = (
+            switch_overhead.first_entry
+            + interference_count
+            * (
+                switch_overhead.first_entry
+                + switch_overhead.preemption
+                + switch_overhead.resumption
+            )
         )
+        nxt = task.wcet + blocking.amount + interference_work + overhead_work
         iterations.append(
-            IterationRecord(round=round_no, value=r, interference=counts, next_value=nxt)
+            IterationRecord(
+                round=round_no,
+                value=r,
+                interference=counts,
+                next_value=nxt,
+                switch_overhead=overhead_work,
+            )
         )
         if nxt > limit:
             return TaskReport(
@@ -347,6 +438,7 @@ def _response_time(
                 iterations=tuple(iterations),
                 response_time=None,
                 status=STATUS_DEADLINE_MISS,
+                switch_overhead=switch_overhead,
                 detail=(
                     f"round {round_no}: R={nxt} exceeds D-J={limit} "
                     f"(deadline miss proven within the model)"
@@ -359,6 +451,7 @@ def _response_time(
                 iterations=tuple(iterations),
                 response_time=r,
                 status=STATUS_SCHEDULABLE,
+                switch_overhead=switch_overhead,
                 detail=(
                     f"converged after {round_no + 1} round(s): R={r} <= D-J={limit}"
                 ),
@@ -374,6 +467,7 @@ def _response_time(
         iterations=tuple(iterations),
         response_time=None,
         status=STATUS_BUDGET_EXHAUSTED,
+        switch_overhead=switch_overhead,
         detail=(
             f"iteration budget of {max_iterations} round(s) exhausted at R={r} "
             f"(inconclusive: neither converged nor proven to miss)"
@@ -382,7 +476,11 @@ def _response_time(
 
 
 def analyze(
-    tasks: Sequence[Task], *, max_iterations: int = DEFAULT_MAX_ITERATIONS
+    tasks: Sequence[Task],
+    *,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    context_switch_cost: SwitchOverhead | int | None = None,
+    switch_overhead: SwitchOverhead | int | None = None,
 ) -> Report:
     """Compute worst-case response-time bounds for a fixed-priority task set.
 
@@ -395,6 +493,11 @@ def analyze(
     ``max_iterations`` bounds the fixed-point search per task; exhausting it
     yields status ``iteration_budget_exhausted`` (inconclusive), which is
     distinct from a proven ``deadline_miss``.
+
+    ``context_switch_cost`` (or the ``switch_overhead`` alias) accepts a
+    :class:`ContextSwitchCost`; a non-negative integer is shorthand for
+    using that same value for all three costs. The default zero value
+    reproduces the overhead-free analysis exactly.
     """
     max_iterations = _as_int(
         max_iterations, field="max_iterations", index=None, task_name=None
@@ -403,6 +506,15 @@ def analyze(
         raise ValidationError(
             f"'max_iterations' must be >= 1, got {max_iterations}"
         )
+    if context_switch_cost is not None and switch_overhead is not None:
+        raise ValidationError(
+            "pass either 'context_switch_cost' or 'switch_overhead', not both"
+        )
+    overhead = _validate_switch_overhead(
+        context_switch_cost if context_switch_cost is not None
+        else switch_overhead if switch_overhead is not None
+        else SwitchOverhead()
+    )
     normalized = _validate_task_set(tasks)
     ceilings = _resource_ceilings(normalized)
 
@@ -415,7 +527,7 @@ def analyze(
     for i, task in enumerate(normalized):
         blocking = _blocking(i, normalized, ceilings)
         reports.append(
-            _response_time(task, normalized[:i], blocking, max_iterations)
+            _response_time(task, normalized[:i], blocking, max_iterations, overhead)
         )
 
     if not utilization_ok:
@@ -445,4 +557,5 @@ def analyze(
         tasks=tuple(reports),
         guaranteed=guaranteed,
         summary=summary,
+        switch_overhead=overhead,
     )
