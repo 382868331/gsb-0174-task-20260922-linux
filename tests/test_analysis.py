@@ -229,5 +229,59 @@ class TestIterationBudget(unittest.TestCase):
         self.assertEqual(analyze(tasks).tasks[1].response_time, 3)
 
 
+class TestContextSwitchCost(unittest.TestCase):
+    def test_zero_cost_preserves_original_analysis(self):
+        report = analyze(main_example(), context_switch_cost=0)
+        self.assertEqual([t.response_time for t in report.tasks], [5, 10, 11])
+
+    def test_initial_dispatch_is_charged_once(self):
+        report = analyze([Task("only", wcet=3, period=10, deadline=10)],
+                         context_switch_cost=2)
+        task = report.tasks[0]
+        self.assertEqual(task.response_time, 5)
+        self.assertEqual(task.iterations[0].next_value, 5)
+
+    def test_blocking_is_retained_with_initial_dispatch(self):
+        tasks = [
+            Task("high", wcet=1, period=5, deadline=5,
+                 critical_sections=(CriticalSection("bus", 1),)),
+            Task("low", wcet=3, period=20, deadline=20,
+                 critical_sections=(CriticalSection("bus", 3),)),
+        ]
+        report = analyze(tasks, context_switch_cost=1)
+        high = report.tasks[0]
+        self.assertEqual(high.blocking.amount, 3)
+        self.assertEqual(high.response_time, 5)  # C=1 + B=3 + initial S=1
+
+    def test_switch_cost_feeds_back_into_interference_count(self):
+        # Formula with S=1:
+        # R0 = C_l + S = 3
+        # Each interference contributes C_h + 2S = 3.
+        # R=3 -> 1 release  -> 6
+        # R=6 -> 2 releases -> 9
+        # R=9 -> 3 releases -> 12 (fixed point)
+        tasks = [
+            Task("high", wcet=1, period=4, deadline=4),
+            Task("low", wcet=2, period=20, deadline=20),
+        ]
+        report = analyze(tasks, context_switch_cost=1)
+        low = report.tasks[1]
+        self.assertEqual(low.status, "schedulable")
+        self.assertEqual(low.response_time, 12)
+        self.assertEqual([r.value for r in low.iterations], [3, 6, 9, 12])
+        self.assertEqual([r.next_value for r in low.iterations], [6, 9, 12, 12])
+
+    def test_extra_preemptions_can_cause_deadline_miss(self):
+        tasks = [
+            Task("high", wcet=1, period=4, deadline=4),
+            Task("low", wcet=2, period=20, deadline=11),
+        ]
+        report = analyze(tasks, context_switch_cost=1)
+        low = report.tasks[1]
+        self.assertEqual(low.status, "deadline_miss")
+        self.assertIsNone(low.response_time)
+        self.assertEqual([r.next_value for r in low.iterations], [6, 9, 12])
+
+
 if __name__ == "__main__":
     unittest.main()

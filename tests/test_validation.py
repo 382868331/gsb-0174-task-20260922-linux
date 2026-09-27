@@ -108,6 +108,15 @@ class TestStructuralValidation(unittest.TestCase):
         with self.assertRaises(ValidationError):
             analyze([base_task()], max_iterations=True)
 
+    def test_context_switch_cost_validated(self):
+        with self.assertRaises(ValidationError) as ctx:
+            analyze([base_task()], context_switch_cost=-1)
+        self.assertIn("context_switch_cost", str(ctx.exception))
+        with self.assertRaises(ValidationError):
+            analyze([base_task()], context_switch_cost=True)
+        report = analyze([base_task()], context_switch_cost=2.0)
+        self.assertEqual(report.tasks[0].response_time, 3)
+
 
 class TestCriticalSectionValidation(unittest.TestCase):
     def test_zero_length_section_rejected(self):

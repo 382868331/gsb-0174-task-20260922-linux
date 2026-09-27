@@ -12,9 +12,13 @@ Model (explicitly conservative, see README):
 * The blocking term ``B_i`` is the largest single critical section among
   lower-priority tasks on a resource whose ceiling is at least the priority
   of task ``i`` (i.e. a critical section that can actually block ``i``).
-* The response-time bound is the least fixed point of
-  ``R = C_i + B_i + sum_{h in hp(i)} ceil((R + J_h) / T_h) * C_h``
-  starting from ``R = C_i + B_i``.  If a candidate exceeds ``D_i - J_i``
+* Let ``S`` be the cost of one context switch.  The analyzed job pays one
+  switch when it first enters the CPU.  Every higher-priority interference
+  can preempt it and later resume it, so that interference contributes
+  ``C_h + 2*S``.  The response-time bound is the least fixed point of
+  ``R = C_i + B_i + S + sum_{h in hp(i)}
+  ceil((R + J_h) / T_h) * (C_h + 2*S)``, starting from
+  ``R = C_i + B_i + S``.  If a candidate exceeds ``D_i - J_i``
   the task is declared a deadline miss; if the value stabilises the task is
   guaranteed (under the model's assumptions).
 
@@ -111,7 +115,8 @@ class IterationRecord:
     ``value`` is the candidate R used in this round, ``interference`` pairs
     each higher-priority task name with the number of interfering releases
     ``ceil((value + J_h) / T_h)``, and ``next_value`` is the resulting new
-    candidate ``C + B + sum(count * C_h)``.
+    candidate including the initial dispatch and the preemption/resumption
+    cost charged for each counted interference.
     """
 
     round: int
@@ -324,18 +329,22 @@ def _blocking(index: int, tasks: tuple[Task, ...], ceilings: dict[str, int]) -> 
 
 
 def _response_time(
-    task: Task, hp: tuple[Task, ...], blocking: BlockingInfo, max_iterations: int
+    task: Task,
+    hp: tuple[Task, ...],
+    blocking: BlockingInfo,
+    switch_cost: int,
+    max_iterations: int,
 ) -> TaskReport:
     limit = task.deadline - task.jitter  # miss when R exceeds D_i - J_i
-    r = task.wcet + blocking.amount
+    r = task.wcet + blocking.amount + switch_cost
     iterations: list[IterationRecord] = []
     for round_no in range(max_iterations):
         counts = tuple(
             (h.name, -(-(r + h.jitter) // h.period))  # exact ceil, integers only
             for h in hp
         )
-        nxt = task.wcet + blocking.amount + sum(
-            n * h.wcet for h, (_, n) in zip(hp, counts)
+        nxt = task.wcet + blocking.amount + switch_cost + sum(
+            n * (h.wcet + 2 * switch_cost) for h, (_, n) in zip(hp, counts)
         )
         iterations.append(
             IterationRecord(round=round_no, value=r, interference=counts, next_value=nxt)
@@ -382,7 +391,10 @@ def _response_time(
 
 
 def analyze(
-    tasks: Sequence[Task], *, max_iterations: int = DEFAULT_MAX_ITERATIONS
+    tasks: Sequence[Task],
+    *,
+    context_switch_cost: int = 0,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
 ) -> Report:
     """Compute worst-case response-time bounds for a fixed-priority task set.
 
@@ -395,7 +407,21 @@ def analyze(
     ``max_iterations`` bounds the fixed-point search per task; exhausting it
     yields status ``iteration_budget_exhausted`` (inconclusive), which is
     distinct from a proven ``deadline_miss``.
+
+    ``context_switch_cost`` (``S``) is the cost of one switch.  The analyzed
+    job pays one initial dispatch, and each higher-priority job counted in an
+    iteration pays two switches: one preemption and one resumption.
     """
+    switch_cost = _as_int(
+        context_switch_cost,
+        field="context_switch_cost",
+        index=None,
+        task_name=None,
+    )
+    if switch_cost < 0:
+        raise ValidationError(
+            f"'context_switch_cost' must be >= 0, got {switch_cost}"
+        )
     max_iterations = _as_int(
         max_iterations, field="max_iterations", index=None, task_name=None
     )
@@ -415,7 +441,9 @@ def analyze(
     for i, task in enumerate(normalized):
         blocking = _blocking(i, normalized, ceilings)
         reports.append(
-            _response_time(task, normalized[:i], blocking, max_iterations)
+            _response_time(
+                task, normalized[:i], blocking, switch_cost, max_iterations
+            )
         )
 
     if not utilization_ok:

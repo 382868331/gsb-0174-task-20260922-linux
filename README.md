@@ -22,7 +22,7 @@ tasks = [
     Task("logger", wcet=4, period=20, deadline=20,
          critical_sections=(CriticalSection("bus", 3),)),
 ]
-report = analyze(tasks)          # -> Report
+report = analyze(tasks, context_switch_cost=1)  # -> Report
 report.guaranteed                # 整体是否可保证
 report.utilization               # Fraction，精确有理数 sum(C/T)
 report.tasks[i].response_time    # R_i（miss/不确定时为 None）
@@ -35,6 +35,9 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 - `analyze(tasks, *, max_iterations=1000)`：`max_iterations` 是每任务
   不动点迭代的搜索预算。预算耗尽得到 `iteration_budget_exhausted`
   （不确定），与已证明的 `deadline_miss` 严格区分。
+- `analyze(..., context_switch_cost=S)`：`S` 是单次上下文切换代价，
+  默认 `0`。分析任务首次进入 CPU 计 1 次；每个高优先级干扰作业计
+  “抢占切出 + 恢复切入”2 次。
 - `simulate(tasks, horizon)`：离散时间轴验证模拟器（固定优先级抢占 +
   优先级天花板协议，作业在 `k*T` 释放，临界区位于执行开头）。用于
   生成具体调度实例并核对观测响应时间不超过分析界；它是验证辅助，
@@ -48,9 +51,12 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
   优先级任务；临界区**禁止嵌套**（数据结构本身不表达嵌套）。
 - 阻塞项 `B_i` = 低优先级任务中、天花板不低于 `i` 优先级的资源上的
   最大单个临界区；输出阻塞来源（任务与资源）。
-- 迭代 `R = C_i + B_i + sum_h ceil((R + J_h) / T_h) * C_h`，从
-  `R = C_i + B_i` 开始；候选值超过 `D_i - J_i` 判 miss，值稳定判可
-  保证。相对名义请求时间的延迟界为 `R_i + J_i`。
+- 上下文切换开销记为 `S`，迭代
+  `R = C_i + B_i + S + sum_h ceil((R + J_h) / T_h) * (C_h + 2*S)`，
+  从 `R = C_i + B_i + S` 开始；候选值超过 `D_i - J_i` 判 miss，值
+  稳定判可保证。开销位于干扰次数的 ceil 内，因此可能导致额外抢占；
+  `S=0` 时公式退回无切换开销分析。相对名义请求时间的延迟界为
+  `R_i + J_i`。
 - 利用率 `U = sum(C/T)`：`U > 1` 返回 `guaranteed=False`（**不是**
   格式错误）；`U <= 1` 只是必要条件，**不**被当作充分保证。
 
@@ -73,8 +79,8 @@ report.tasks[i].status           # "schedulable" | "deadline_miss" | "iteration_
 
 - 分析是**保守充分**条件而非精确充要条件：可保证的结论可靠，判 miss
   的结论在该保守模型内成立，但不排除存在更精细分析可通过的实例。
-- 模型不含上下文切换开销、缓存效应、多核、任务间任意依赖；仅覆盖
-  本题契约的周期/偶发 + 抖动 + 天花板协议子集，不宣称完整行业标准
+- 模型不包含模拟器内的切换开销建模、缓存效应、多核、任务间任意依赖；
+  分析器可显式计入保守的统一上下文切换代价，但不宣称完整行业标准
   （如完整 OSEK/AUTOSAR 语义）兼容。
 - 模拟器采用一种具体实现（临界区位于执行开头、`k*T` 同步释放），
   用于“不超过界”的实例级核对，不枚举最坏情形。
